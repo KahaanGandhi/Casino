@@ -2,14 +2,17 @@ import pandas as pd
 import yfinance as yf
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
 from torch import nn
 from torch_geometric.data import Data
 from torch_geometric.nn import GATConv, GCNConv
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
-from datetime import datetime
+from datetime import datetime, timedelta
 from tabulate import tabulate
+import warnings
+
+warnings.filterwarnings('ignore')
 
 # Parameters
 tickers = [
@@ -19,10 +22,10 @@ tickers = [
     'LRCX', 'MCHP', 'NTAP', 'PAYX', 'SNPS', 'STX', 'SWKS'
 ]
 start_date = '2018-01-01'
-end_date = '2020-12-31'
+end_date = '2021-12-31'
 hidden_dim = 32
 num_heads = 4
-epochs = 20
+epochs = 10
 learning_rate = 0.001
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
@@ -60,6 +63,37 @@ def preprocess_data(data, valid_tickers):
 
 combined_data = preprocess_data(data, valid_tickers)
 
+# Generate features and labels
+def generate_features_labels(combined_data):
+    returns = combined_data.pct_change().fillna(0)
+    features = returns.shift(1).fillna(0)
+    labels = returns
+    return features, labels
+
+features, labels = generate_features_labels(combined_data)
+dates = features.index
+
+# Create data objects without edge_index (will be assigned during backtesting)
+def create_data_objects(features, labels):
+    data_list = []
+    num_nodes = features.shape[1]
+    for idx in range(len(features)):
+        x = torch.tensor(features.iloc[idx].values, dtype=torch.float).unsqueeze(1)
+        y = torch.tensor(labels.iloc[idx].values, dtype=torch.float)
+        data_obj = Data(x=x, y=y)
+        data_obj.date = features.index[idx]
+        data_obj.num_nodes = num_nodes
+        data_list.append(data_obj)
+    return data_list
+
+data_list = create_data_objects(features, labels)
+
+# Benchmark against S&P 500 and Technology Index Fund
+benchmark = yf.download('^GSPC', start=start_date, end=end_date, progress=False)['Adj Close'].pct_change().dropna()
+benchmark = benchmark[dates[0]:dates[-1]]
+tech_index = yf.download('QQQ', start=start_date, end=end_date, progress=False)['Adj Close'].pct_change().dropna()
+tech_index = tech_index[dates[0]:dates[-1]]
+
 # Create correlation matrix and edge indices
 def create_edge_index(correlation_matrix, threshold):
     edge_index = []
@@ -72,65 +106,6 @@ def create_edge_index(correlation_matrix, threshold):
         raise ValueError(f"No edges found with correlation threshold {threshold}. Adjust the threshold.")
     edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
     return edge_index
-
-returns = combined_data.pct_change().dropna()
-correlation_matrix = returns.corr()
-
-# Edge indices for different strategies
-edge_index_arbitrage = create_edge_index(correlation_matrix, threshold=0.6)
-edge_index_longshort = create_edge_index(correlation_matrix, threshold=0.75)
-
-# Generate features and labels
-def generate_features_labels(combined_data):
-    returns = combined_data.pct_change().fillna(0)
-    features = returns.shift(1).fillna(0)
-    labels = returns
-    return features, labels
-
-features, labels = generate_features_labels(combined_data)
-dates = features.index
-
-# Create data objects for arbitrate and long-short strategies
-def create_data_objects(features, labels, edge_index_arbitrage, edge_index_longshort):
-    data_list_arbitrage = []
-    data_list_longshort = []
-    num_nodes = features.shape[1]
-    for idx in range(len(features)):
-        x = torch.tensor(features.iloc[idx].values, dtype=torch.float).unsqueeze(1)
-        y = torch.tensor(labels.iloc[idx].values, dtype=torch.float)
-
-        data_arbitrage = Data(x=x, edge_index=edge_index_arbitrage, y=y)
-        data_arbitrage.date = dates[idx]
-        data_arbitrage.num_nodes = num_nodes
-        data_list_arbitrage.append(data_arbitrage)
-
-        data_longshort = Data(x=x, edge_index=edge_index_longshort, y=y)
-        data_longshort.date = dates[idx]
-        data_longshort.num_nodes = num_nodes
-        data_list_longshort.append(data_longshort)
-    return data_list_arbitrage, data_list_longshort
-
-data_list_arbitrage, data_list_longshort = create_data_objects(features, labels, edge_index_arbitrage, edge_index_longshort)
-
-# For momentum strategy, we can use the same data list
-data_list_momentum = data_list_arbitrage
-
-# Split into training and tests sets
-split_idx = int(len(data_list_arbitrage) * 0.7)
-train_data_arbitrage = data_list_arbitrage[:split_idx]
-test_data_arbitrage = data_list_arbitrage[split_idx:]
-
-train_data_momentum = data_list_momentum[:split_idx]
-test_data_momentum = data_list_momentum[split_idx:]
-
-train_data_longshort = data_list_longshort[:split_idx]
-test_data_longshort = data_list_longshort[split_idx:]
-
-# Benchmark against S&P 500 and Technology Index Fund
-benchmark = yf.download('^GSPC', start=start_date, end=end_date, progress=False)['Adj Close'].pct_change().dropna()
-benchmark = benchmark[dates[0]:dates[-1]]
-tech_index = yf.download('QQQ', start=start_date, end=end_date, progress=False)['Adj Close'].pct_change().dropna()
-tech_index = tech_index[dates[0]:dates[-1]]
 
 # Models for Each Strategy
 # Arbitrage on lagged price movements
@@ -186,7 +161,6 @@ class LongShortModel(nn.Module):
         x = self.fc(x)
         return x.squeeze()
 
-
 # Training loop
 def train(model, train_data, epochs, learning_rate, device, strategy_name):
     model = model.to(device)
@@ -197,9 +171,9 @@ def train(model, train_data, epochs, learning_rate, device, strategy_name):
 
     for epoch in range(epochs):
         total_loss = 0
-        if strategy_name == 'Momentum Trading on Diffusion Spikes':
+        if strategy_name == 'Momentum Trading on Diffusion Spikes' or strategy_name == 'Momentum':
             iter_range = range(seq_length, len(train_data))
-            train_iter = tqdm(iter_range, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
+            train_iter = iter_range  # Remove tqdm here to simplify progress bars
             for idx in train_iter:
                 data_seq = train_data[idx - seq_length:idx]
                 x_seq_list = [d.x.to(device) for d in data_seq]
@@ -212,11 +186,9 @@ def train(model, train_data, epochs, learning_rate, device, strategy_name):
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
-                avg_loss = total_loss / (idx - seq_length + 1)
-                train_iter.set_postfix({'Loss': avg_loss})
         else:
-            train_iter = tqdm(train_data, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
-            for data in train_iter:
+            train_iter = train_data
+            for idx, data in enumerate(train_iter):
                 data = data.to(device)
                 optimizer.zero_grad()
                 out = model(data.x, data.edge_index)
@@ -224,46 +196,82 @@ def train(model, train_data, epochs, learning_rate, device, strategy_name):
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
-                avg_loss = total_loss / (train_data.index(data)+1)
-                train_iter.set_postfix({'Loss': avg_loss})
     return model
 
-# Backtest on historical data
-def backtest(model, test_data, device, strategy_name):
-    model = model.to(device)
-    model.eval()
+# Backtest with walk-forward validation
+def walk_forward_backtest(model_class, data_list, device, strategy_name):
     predictions = []
     actuals = []
-    dates = []
-    seq_length = 5  # Sequence length for LSTM
+    dates_list = []
+    retrain_interval = 14  # Retrain the model every 14 days
+    initial_train_size = 252  # Use the first 252 days (~1 year) for initial training
 
-    with torch.no_grad():
-        if strategy_name == 'Momentum Trading on Diffusion Spikes':
-            iter_range = range(seq_length, len(test_data))
-            test_iter = tqdm(iter_range, desc=f"Backtesting {strategy_name}", leave=False)
-            for idx in test_iter:
-                data_seq = test_data[idx - seq_length:idx]
-                x_seq_list = [d.x.to(device) for d in data_seq]
-                edge_index_list = [d.edge_index.to(device) for d in data_seq]
-                y = test_data[idx].y.mean().to(device)
-                date = test_data[idx].date
+    # print(f"\nStarting walk-forward backtesting for {strategy_name}...")
 
-                out = model(x_seq_list, edge_index_list)
-                predictions.append(out.cpu().numpy())
-                actuals.append(y.cpu().numpy())
-                dates.append(date)
+    total_periods = (len(data_list) - initial_train_size) // retrain_interval
+    backtest_progress = tqdm(range(initial_train_size, len(data_list) - 1, retrain_interval), desc=f"Backtesting {strategy_name}")
+
+    for i in backtest_progress:
+        # Define training and test sets
+        train_data = data_list[:i]
+        test_data = data_list[i:i + retrain_interval]
+
+        if len(test_data) == 0:
+            break
+
+        # Prepare edge indices using training data only
+        train_features = features.iloc[:i]
+        train_labels = labels.iloc[:i]
+        train_returns = train_labels
+        correlation_matrix = train_returns.corr()
+
+        # Create edge indices based on strategy
+        if strategy_name == 'Arbitrage on Lagged Price Movements' or strategy_name == 'Momentum Trading on Diffusion Spikes' or strategy_name == "Statistical Arbitrage" or strategy_name == "Momentum":
+            edge_index = create_edge_index(correlation_matrix, threshold=0.6)
         else:
-            test_iter = tqdm(test_data, desc=f"Backtesting {strategy_name}", leave=False)
-            for data in test_iter:
-                data = data.to(device)
-                out = model(data.x, data.edge_index)
-                predictions.extend(out.cpu().numpy())
-                actuals.extend(data.y.cpu().numpy())
-                dates.extend([data.date] * data.num_nodes)
+            edge_index = create_edge_index(correlation_matrix, threshold=0.75)
+
+        # Update data objects with new edge_index
+        for data_obj in train_data + test_data:
+            data_obj.edge_index = edge_index
+
+        # Initialize and train the model
+        if strategy_name == 'Momentum Trading on Diffusion Spikes' or strategy_name == 'Momentum':
+            model = model_class(num_features=1, hidden_dim=hidden_dim, lstm_hidden_dim=hidden_dim)
+        else:
+            model = model_class(num_features=1, hidden_dim=hidden_dim, num_heads=num_heads)
+        model = train(model, train_data, epochs, learning_rate, device, strategy_name)
+
+        # Make predictions on test data
+        model.eval()
+        seq_length = 5  # For momentum strategy
+
+        with torch.no_grad():
+            if strategy_name == 'Momentum Trading on Diffusion Spikes' or strategy_name == 'Momentum':
+                iter_range = range(seq_length, len(test_data))
+                for idx in iter_range:
+                    data_seq = test_data[idx - seq_length:idx]
+                    x_seq_list = [d.x.to(device) for d in data_seq]
+                    edge_index_list = [d.edge_index.to(device) for d in data_seq]
+                    y = test_data[idx].y.mean().to(device)
+                    date = test_data[idx].date
+
+                    out = model(x_seq_list, edge_index_list)
+                    predictions.append(out.cpu().numpy())
+                    actuals.append(y.cpu().numpy())
+                    dates_list.append(date)
+            else:
+                for data in test_data:
+                    data = data.to(device)
+                    out = model(data.x, data.edge_index)
+                    predictions.extend(out.cpu().numpy())
+                    actuals.extend(data.y.cpu().numpy())
+                    dates_list.extend([data.date] * data.num_nodes)
+
     predictions = np.array(predictions)
     actuals = np.array(actuals)
-    dates = pd.to_datetime(dates)
-    return predictions, actuals, dates
+    dates_list = pd.to_datetime(dates_list)
+    return predictions, actuals, dates_list
 
 # Calculate cumulative returns and metrics
 def evaluate_strategy(predictions, actuals, dates, benchmark_returns, strategy_name):
@@ -294,42 +302,29 @@ def evaluate_strategy(predictions, actuals, dates, benchmark_returns, strategy_n
 
     return cumulative_returns, benchmark_cum_returns, metrics, strategy_returns
 
-# Initialize and train models
-strategy_models = {}
+# Initialize and backtest models
 strategy_results = {}
 
 # Strategy 1: arbitrage on lagged price movements
-print("\nTraining: Arbitrage on Lagged Price Movements")
-arbitrage_model = ArbitrageModel(num_features=1, hidden_dim=hidden_dim, num_heads=num_heads)
-arbitrage_model = train(arbitrage_model, train_data_arbitrage, epochs, learning_rate, device, 'Arbitrage on Lagged Price Movements')
-predictions_a, actuals_a, dates_a = backtest(arbitrage_model, test_data_arbitrage, device, 'Arbitrage on Lagged Price Movements')
+predictions_a, actuals_a, dates_a = walk_forward_backtest(ArbitrageModel, data_list, device, 'Statistical Arbitrage')
 cumulative_returns_a, benchmark_cum_returns_a, metrics_a, strategy_returns_a = evaluate_strategy(predictions_a, actuals_a, dates_a, benchmark, 'Arbitrage on Lagged Price Movements')
-strategy_models['Arbitrage on Lagged Price Movements'] = arbitrage_model
 strategy_results['Arbitrage on Lagged Price Movements'] = (cumulative_returns_a, metrics_a)
 
 # Strategy 2: momentum trading on diffusion spikes
-print("\nTraining: Momentum Trading on Diffusion Spikes")
-momentum_model = MomentumModel(num_features=1, hidden_dim=hidden_dim, lstm_hidden_dim=hidden_dim)
-momentum_model = train(momentum_model, train_data_momentum, epochs, learning_rate, device, 'Momentum Trading on Diffusion Spikes')
-predictions_b, actuals_b, dates_b = backtest(momentum_model, test_data_momentum, device, 'Momentum Trading on Diffusion Spikes')
+predictions_b, actuals_b, dates_b = walk_forward_backtest(MomentumModel, data_list, device, 'Momentum')
 cumulative_returns_b, benchmark_cum_returns_b, metrics_b, strategy_returns_b = evaluate_strategy(predictions_b, actuals_b, dates_b, benchmark, 'Momentum Trading on Diffusion Spikes')
-strategy_models['Momentum Trading on Diffusion Spikes'] = momentum_model
 strategy_results['Momentum Trading on Diffusion Spikes'] = (cumulative_returns_b, metrics_b)
 
 # Strategy 3: long-short basket trading on correlated stocks
-print("\nTraining: Long-Short Basket Trading on Correlated Stocks")
-long_short_model = LongShortModel(num_features=1, hidden_dim=hidden_dim, num_heads=num_heads)
-long_short_model = train(long_short_model, train_data_longshort, epochs, learning_rate, device, 'Long-Short Basket Trading on Correlated Stocks')
-predictions_c, actuals_c, dates_c = backtest(long_short_model, test_data_longshort, device, 'Long-Short Basket Trading on Correlated Stocks')
+predictions_c, actuals_c, dates_c = walk_forward_backtest(LongShortModel, data_list, device, 'Market Neutral')
 cumulative_returns_c, benchmark_cum_returns_c, metrics_c, strategy_returns_c = evaluate_strategy(predictions_c, actuals_c, dates_c, benchmark, 'Long-Short Basket Trading on Correlated Stocks')
-strategy_models['Long-Short Basket Trading on Correlated Stocks'] = long_short_model
 strategy_results['Long-Short Basket Trading on Correlated Stocks'] = (cumulative_returns_c, metrics_c)
 
 # Plot cumulative returns
 plt.figure(figsize=(12, 6))
-plt.plot(cumulative_returns_a.index, cumulative_returns_a['Returns'], label='Arbitrage on Lagged Price Movements')
-plt.plot(cumulative_returns_b.index, cumulative_returns_b['Returns'], label='Momentum Trading on Diffusion Spikes')
-plt.plot(cumulative_returns_c.index, cumulative_returns_c['Returns'], label='Long-Short Basket Trading on Correlated Stocks')
+plt.plot(cumulative_returns_a.index, cumulative_returns_a['Returns'], label='Statistical Arbitrage')
+plt.plot(cumulative_returns_b.index, cumulative_returns_b['Returns'], label='Momentum')
+plt.plot(cumulative_returns_c.index, cumulative_returns_c['Returns'], label='Market Neutral')
 plt.plot(benchmark_cum_returns_a.index, benchmark_cum_returns_a.values, label='Benchmark (S&P 500)')
 tech_index = tech_index[cumulative_returns_a.index[0]:cumulative_returns_a.index[-1]]
 tech_cum_returns = (1 + tech_index).cumprod() - 1
@@ -338,7 +333,6 @@ plt.legend()
 plt.title('Cumulative Returns Comparison')
 plt.xlabel('Date')
 plt.ylabel('Cumulative Return')
-plt.show()
 
 # Print metrics as table
 metrics_data = [
@@ -349,3 +343,5 @@ metrics_data = [
 
 headers = ['Strategy', 'Alpha', 'Beta', 'Sharpe Ratio']
 print(tabulate(metrics_data, headers=headers, tablefmt='grid'))
+plt.savefig('returns.png', dpi=800)
+plt.show()
